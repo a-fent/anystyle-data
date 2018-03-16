@@ -10,57 +10,77 @@ end
 require 'rake'
 require 'rake/clean'
 
+DATA = 'lib/anystyle/data'
+
 CLEAN.include('*.gem')
-CLEAN.include('lib/anystyle/data/dict.txt.gz')
+CLEAN.include("#{DATA}/dict.txt")
+CLEAN.include("#{DATA}/dict.txt.gz")
 
+task :compile => ["#{DATA}/dict.txt.gz"]
 
-task :compile => [:clean, 'lib/anystyle/data/dict.txt.gz'] do
-
+rule '.txt.gz' => '.txt' do |t|
+  require 'zlib'
+  Zlib::GzipWriter.open(t.name) do |zip|
+    zip.mtime = File.mtime(t.source)
+    zip.orig_name = t.source
+    zip.write IO.binread(t.source)
+  end
+  puts "#{File.stat(t.name).size / 1024}k compressed"
 end
 
-require 'yaml'
-DIC_DEF_FILE = 'res/dictionary.yaml'
-dict_def = YAML.load(File.read(DIC_DEF_FILE))
-dict_def.each do | cat, files |
-  dict_def[cat] = files.map { | f | "res/dict-src/#{f}.txt" }
-end
+file "#{DATA}/dict.txt" => FileList['res/*.txt'] do |t|
+  dict = {}
 
-file 'lib/anystyle/data/dict.txt.gz' =>
-     [ DIC_DEF_FILE, *dict_def.values.flatten ] do | dic_file |
-  entries = {}
-  comments = {}
-  dict_def.each do | cat, dfiles |
-    entries[cat] ||= {}
-    comments[cat] ||= []
-    dfiles.each do | dfile |
-      multitokens = false
-      File.foreach(dfile, encoding: "UTF-8") do | line |
-        case line
-        when /^#\+\s*MULTITOKENS/i
-          multitokens = true
-        when /^##/
-          comments[cat] << line
-        when /^#/ # Discard
-        else # 
-          # Canonical - lower case, no punctuation
-          line = line.gsub(/(?:\p{P}|\p{S})/, "").downcase
-          if multitokens # More than one per line
-            tokens = line.split(/\s+/).grep_v(/^\d+$/)
-          else # Only first per line
-            tokens = [ line.split(/\s+(\d+\.\d+)\s*$/)[0] ] 
-          end
-          tokens.each { | tok | entries[cat][tok] = true }
+  puts "Compiling dictionary from #{t.prerequisites.size} sources ..."
+  t.prerequisites.each do |file|
+    cat = ''
+    puts " <- #{File.basename(file)}"
+    File.foreach(file, encoding: 'UTF-8') do |line|
+      case line
+      when /^#! (\w+)/
+        cat = $1
+        dict[cat] ||= []
+      when /^#/
+        # discard comments...
+      else
+        # Only first word per line is token
+        token = line.split(/\s+(\d+\.\d+)\s*$/)[0]
+
+        # Strip punctuation and whitespace at start and end
+        token.gsub!(/^[\p{P}\p{S}\s]+|[\p{P}\p{S}\s]+$/, '')
+
+        # Replace characters with diacritic marks
+        # with their base equivalent
+        token.unicode_normalize!(:nfkd)
+        token.gsub!(/\p{M}/, '')
+
+        # Get rid of special characters like apostrophes
+        token.gsub!(/\p{Lm}/, '')
+        token.downcase!
+
+        # Split words on punctuation and keep all pieces
+        # that are at least 3 characters long as well as
+        # the original word with all punctuation removed
+        pieces = token.split(/[\p{P}\p{S}]/)
+        pieces << token.gsub(/[\p{P}\p{S}]/, '') if pieces.count > 1
+        pieces.each do |piece|
+          dict[cat] << piece if piece.length >= 3 && piece =~ /\p{L}/
         end
       end
     end
   end
-  
-  require 'zlib'
-  Zlib::GzipWriter.open(dic_file.to_s) do | dic_zip |
-    entries.each do | cat, items |
-      dic_zip.puts "## @#{cat}@"
-      comments[cat].each { | c | dic_zip.puts c }
-      items.keys.sort.each { | i | dic_zip.puts i }
+
+  puts "Writing dictionary to #{t.name} ..."
+  File.open(t.name, 'w') do |f|
+    dict.each do |cat, words|
+      words = words.uniq.sort
+      next if words.empty?
+      puts " <- %6d #! #{cat}" % [words.size]
+
+      f.puts "#! #{cat}"
+      words.each { |word| f.puts word }
     end
   end
+
+  puts "#{File.stat(t.name).size / 1024}k written"
 end
